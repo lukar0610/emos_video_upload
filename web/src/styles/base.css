@@ -1,0 +1,70 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --color-ink: #21313a;
+  --color-muted: #657681;
+  --color-muted-light: #96a5ad;
+  --color-canvas: #f4f7f8;
+  --color-line: #d7e2e6;
+  --color-line-soft: #e7eef0;
+  --color-accent: #206f83;
+  --color-accent-dark: #18586a;
+  --color-accent-soft: #e6f2f5;
+  --color-warning: #b66b20;
+  --color-warning-soft: #fff4e2;
+  --color-danger: #b6524b;
+  --color-danger-soft: #fff0ee;
+}
+
+@layer base {
+  :root {
+    color: var(--color-ink);
+    background: var(--color-canvas);
+    font-family: var(--font-sans);
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    min-width: 320px;
+    min-height: 100vh;
+    margin: 0;
+    background: var(--color-canvas);
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible {
+    outline: 3px solid rgb(32 111 131 / 20%);
+    outline-offset: 2px;
+  }
+
+  .source-browser-scroll {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .source-browser-row {
+    content-visibility: auto;
+    contain-intrinsic-size: 47px;
+  }
+}
