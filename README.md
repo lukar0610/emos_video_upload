@@ -28,6 +28,8 @@ cp .env.example .env
 
 修改里面的 `PASSWORD` `EMOS_TOKEN` `VIDEO_ROOT`
 
+R2 分片上传超时可通过 `R2_UPLOAD_TIMEOUT` 单独调整，默认 `10m`。
+
 ## 启动
 
 ```bash

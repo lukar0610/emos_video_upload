@@ -55,6 +55,7 @@ type Server struct {
 	httpServer *http.Server
 	auth       *Auth
 	httpClient *http.Client
+	r2Client   *http.Client
 	closeOnce  sync.Once
 }
 
@@ -82,6 +83,7 @@ func NewServer(cfg Config, static fs.FS) (*Server, error) {
 		static:     static,
 		auth:       NewAuth(cfg.Username, cfg.Password),
 		httpClient: &http.Client{Timeout: cfg.HTTPTimeout},
+		r2Client:   &http.Client{Timeout: cfg.R2UploadTimeout},
 	}
 	server.tasks = NewTaskManager(server)
 	server.httpServer = &http.Server{
@@ -173,6 +175,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleDeleteCompletedTasks(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/retry"):
 		s.handleTaskRetry(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/pause"):
+		s.handleTaskPause(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/resume"):
+		s.handleTaskResume(w, r)
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/tasks/"):
 		s.handleTaskDelete(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/tasks/"):
@@ -533,22 +539,53 @@ func (s *Server) handleTaskRetry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, taskStatus(task))
 }
 
+func (s *Server) handleTaskPause(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/tasks/"), "/pause")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, "invalid task id")
+		return
+	}
+	task, err := s.tasks.Pause(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, errTaskDone) || errors.Is(err, errTaskNotActive) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, taskStatus(task))
+}
+
+func (s *Server) handleTaskResume(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/tasks/"), "/resume")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, "invalid task id")
+		return
+	}
+	task, err := s.tasks.ResumeTask(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, errTaskRunning) || errors.Is(err, errTaskDone) || errors.Is(err, errTaskNotPaused) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, taskStatus(task))
+}
+
 func (s *Server) handleTaskDelete(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusBadRequest, "invalid task id")
 		return
 	}
-	task, err := s.db.GetTask(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	if task.Status == "running" {
-		writeError(w, http.StatusConflict, "running task cannot be deleted")
-		return
-	}
-	if err := s.db.DeleteTask(r.Context(), id); err != nil {
+	if err := s.tasks.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

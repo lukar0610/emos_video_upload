@@ -114,7 +114,7 @@ func (s *Server) getUploadToken(ctx context.Context, task TaskRecord, fileType s
 		var response UploadTokenResponse
 		if json.Unmarshal([]byte(cached.RawJSON), &response) == nil &&
 			strings.TrimSpace(response.FileID) != "" &&
-			(cached.Completed || time.Now().Before(cached.ExpiresAt)) {
+			(cached.Completed || cached.MultipartCompleted || time.Now().Before(cached.ExpiresAt)) {
 			return response, cacheKey, nil
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -311,6 +311,9 @@ func (s *Server) uploadR2Multipart(ctx context.Context, task TaskRecord, file *o
 		}
 		cached = UploadTokenRecord{}
 	}
+	if cached.MultipartCompleted {
+		return s.tasks.UpdateProgress(task.ID, "合并分片", 94, total, total)
+	}
 	var presigns []MultipartPresign
 	if cached.PresignsJSON != "" {
 		_ = json.Unmarshal([]byte(cached.PresignsJSON), &presigns)
@@ -328,14 +331,44 @@ func (s *Server) uploadR2Multipart(ctx context.Context, task TaskRecord, file *o
 			return err
 		}
 	}
+	presignIndexes := make(map[int]int, len(presigns))
+	for index, part := range presigns {
+		presignIndexes[part.Number] = index
+	}
 	parts := make([]MultipartPart, partCount)
+	var uploaded atomic.Int64
+	for _, part := range decodeMultipartParts(cached.MultipartPartsJSON) {
+		index, ok := presignIndexes[part.Number]
+		if !ok || parts[index].ETag != "" || strings.TrimSpace(part.ETag) == "" {
+			continue
+		}
+		parts[index] = part
+		uploaded.Add(multipartPartLength(index, partSize, total))
+	}
+	if completed := uploaded.Load(); completed > 0 {
+		if err := s.tasks.UpdateProgress(task.ID, "上传分片", uploadProgress(completed, total), completed, total); err != nil {
+			return err
+		}
+	}
+	pendingParts := 0
+	for _, part := range parts {
+		if part.ETag == "" {
+			pendingParts++
+		}
+	}
+	client := s.r2Client
+	if client == nil {
+		client = s.httpClient
+	}
+	uploadCtx, cancelUploads := context.WithCancel(ctx)
+	defer cancelUploads()
 	jobs := make(chan int)
 	errCh := make(chan error, 1)
-	var uploaded atomic.Int64
+	var partsMu sync.Mutex
 	var wg sync.WaitGroup
 	workers := s.cfg.UploadConcurrency
-	if workers > partCount {
-		workers = partCount
+	if workers > pendingParts {
+		workers = pendingParts
 	}
 	for worker := 0; worker < workers; worker++ {
 		wg.Add(1)
@@ -348,7 +381,7 @@ func (s *Server) uploadR2Multipart(ctx context.Context, task TaskRecord, file *o
 				if remaining := total - offset; remaining < length {
 					length = remaining
 				}
-				etag, uploadErr := uploadMultipartPart(ctx, s.httpClient, part.UploadURL, file, offset, length, s.cfg.UploadRetryMax, func(delta int64) {
+				etag, uploadErr := uploadMultipartPart(uploadCtx, client, part.UploadURL, file, offset, length, s.cfg.UploadRetryMax, func(delta int64) {
 					current := uploaded.Add(delta)
 					_ = s.tasks.UpdateProgress(task.ID, "上传分片", uploadProgress(current, total), current, total)
 				})
@@ -357,20 +390,46 @@ func (s *Server) uploadR2Multipart(ctx context.Context, task TaskRecord, file *o
 					case errCh <- fmt.Errorf("multipart part %d: %w", part.Number, uploadErr):
 					default:
 					}
+					cancelUploads()
 					continue
 				}
+				partsMu.Lock()
 				parts[index] = MultipartPart{Number: part.Number, ETag: etag}
+				raw, encodeErr := encodeCompletedMultipartParts(parts)
+				if encodeErr == nil {
+					encodeErr = s.db.SaveMultipartParts(ctx, cacheKey, raw)
+				}
+				partsMu.Unlock()
+				if encodeErr != nil {
+					select {
+					case errCh <- fmt.Errorf("save multipart part %d: %w", part.Number, encodeErr):
+					default:
+					}
+					cancelUploads()
+				}
 			}
 		}()
 	}
 	for index := range presigns {
+		if parts[index].ETag != "" {
+			continue
+		}
 		select {
 		case jobs <- index:
-		case <-ctx.Done():
+		case <-uploadCtx.Done():
 			close(jobs)
 			wg.Wait()
+			select {
+			case err := <-errCh:
+				return err
+			default:
+			}
+			if err := uploadCtx.Err(); err != nil {
+				return err
+			}
 			return ctx.Err()
 		case err := <-errCh:
+			cancelUploads()
 			close(jobs)
 			wg.Wait()
 			return err
@@ -383,17 +442,50 @@ func (s *Server) uploadR2Multipart(ctx context.Context, task TaskRecord, file *o
 		return err
 	default:
 	}
+	for index, part := range parts {
+		if part.ETag == "" {
+			return fmt.Errorf("multipart part %d is incomplete", presigns[index].Number)
+		}
+	}
 	sort.Slice(parts, func(i, j int) bool { return parts[i].Number < parts[j].Number })
 	if err := s.tasks.UpdateProgress(task.ID, "合并分片", 94, total, total); err != nil {
 		return err
-	}
-	if cached.MultipartCompleted {
-		return nil
 	}
 	if err := s.emos.CompleteMultipart(ctx, token.FileID, parts); err != nil {
 		return err
 	}
 	return s.db.MarkMultipartCompleted(ctx, cacheKey)
+}
+
+func multipartPartLength(index int, partSize, total int64) int64 {
+	offset := int64(index) * partSize
+	length := partSize
+	if remaining := total - offset; remaining < length {
+		length = remaining
+	}
+	if length < 0 {
+		return 0
+	}
+	return length
+}
+
+func decodeMultipartParts(raw string) []MultipartPart {
+	var parts []MultipartPart
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &parts) != nil {
+		return nil
+	}
+	return parts
+}
+
+func encodeCompletedMultipartParts(parts []MultipartPart) (string, error) {
+	completed := make([]MultipartPart, 0, len(parts))
+	for _, part := range parts {
+		if part.Number > 0 && strings.TrimSpace(part.ETag) != "" {
+			completed = append(completed, part)
+		}
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].Number < completed[j].Number })
+	return encodeJSON(completed)
 }
 
 func uploadMultipartPart(ctx context.Context, client *http.Client, uploadURL string, file *os.File, offset, length int64, retries int, onProgress func(int64)) (string, error) {

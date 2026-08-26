@@ -10,10 +10,44 @@ import (
 )
 
 var (
-	errTaskRunning = errors.New("task is running")
-	errTaskDone    = errors.New("task is already complete")
-	errTaskClosed  = errors.New("task manager is closed")
+	errTaskRunning   = errors.New("task is running")
+	errTaskDone      = errors.New("task is already complete")
+	errTaskClosed    = errors.New("task manager is closed")
+	errTaskNotPaused = errors.New("task is not paused")
+	errTaskNotActive = errors.New("task is not queued or running")
 )
+
+type taskCancelAction string
+
+const (
+	taskCancelNone   taskCancelAction = ""
+	taskCancelPause  taskCancelAction = "pause"
+	taskCancelDelete taskCancelAction = "delete"
+)
+
+type activeTask struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu     sync.Mutex
+	action taskCancelAction
+}
+
+func (t *activeTask) request(action taskCancelAction) {
+	t.mu.Lock()
+	if action == taskCancelDelete || t.action == taskCancelNone {
+		t.action = action
+	}
+	t.mu.Unlock()
+	t.cancel()
+}
+
+func (t *activeTask) requestedAction() taskCancelAction {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.action
+}
 
 type TaskManager struct {
 	server *Server
@@ -21,7 +55,7 @@ type TaskManager struct {
 	cancel context.CancelFunc
 	sem    chan struct{}
 	mu     sync.Mutex
-	active map[string]struct{}
+	active map[string]*activeTask
 	wg     sync.WaitGroup
 	close  sync.Once
 	closed bool
@@ -34,7 +68,7 @@ func NewTaskManager(server *Server) *TaskManager {
 		ctx:    ctx,
 		cancel: cancel,
 		sem:    make(chan struct{}, server.cfg.TaskConcurrency),
-		active: map[string]struct{}{},
+		active: map[string]*activeTask{},
 	}
 }
 
@@ -60,9 +94,11 @@ func (m *TaskManager) Start(id string) error {
 	if _, exists := m.active[id]; exists {
 		return nil
 	}
-	m.active[id] = struct{}{}
+	taskCtx, cancel := context.WithCancel(m.ctx)
+	active := &activeTask{ctx: taskCtx, cancel: cancel, done: make(chan struct{})}
+	m.active[id] = active
 	m.wg.Add(1)
-	go m.run(id)
+	go m.run(id, active)
 	return nil
 }
 
@@ -88,37 +124,136 @@ func (m *TaskManager) Retry(ctx context.Context, id string) (TaskRecord, error) 
 	return m.server.db.GetTask(ctx, id)
 }
 
-func (m *TaskManager) run(id string) {
+func (m *TaskManager) ResumeTask(ctx context.Context, id string) (TaskRecord, error) {
+	task, err := m.server.db.GetTask(ctx, id)
+	if err != nil {
+		return TaskRecord{}, err
+	}
+	switch task.Status {
+	case "running":
+		return TaskRecord{}, errTaskRunning
+	case "success":
+		return TaskRecord{}, errTaskDone
+	case "queued":
+	case "paused":
+		if err := m.server.db.QueueTask(ctx, id, "等待恢复"); err != nil {
+			return TaskRecord{}, err
+		}
+	default:
+		return TaskRecord{}, errTaskNotPaused
+	}
+	if err := m.Start(id); err != nil {
+		return TaskRecord{}, err
+	}
+	return m.server.db.GetTask(ctx, id)
+}
+
+func (m *TaskManager) Pause(ctx context.Context, id string) (TaskRecord, error) {
+	task, err := m.server.db.GetTask(ctx, id)
+	if err != nil {
+		return TaskRecord{}, err
+	}
+	switch task.Status {
+	case "paused":
+		return task, nil
+	case "queued", "running":
+	case "success":
+		return TaskRecord{}, errTaskDone
+	default:
+		return TaskRecord{}, errTaskNotActive
+	}
+	active := m.activeTask(id)
+	if active == nil {
+		if err := m.server.db.PauseTask(ctx, id); err != nil {
+			return TaskRecord{}, err
+		}
+		return m.server.db.GetTask(ctx, id)
+	}
+	active.request(taskCancelPause)
+	select {
+	case <-active.done:
+	case <-ctx.Done():
+		return TaskRecord{}, ctx.Err()
+	}
+	return m.server.db.GetTask(ctx, id)
+}
+
+func (m *TaskManager) Delete(ctx context.Context, id string) error {
+	if _, err := m.server.db.GetTask(ctx, id); err != nil {
+		return err
+	}
+	active := m.activeTask(id)
+	if active != nil {
+		active.request(taskCancelDelete)
+		select {
+		case <-active.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return m.server.db.DeleteTask(ctx, id)
+}
+
+func (m *TaskManager) activeTask(id string) *activeTask {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.active[id]
+}
+
+func (m *TaskManager) run(id string, active *activeTask) {
 	defer m.wg.Done()
+	defer close(active.done)
 	defer func() {
 		m.mu.Lock()
-		delete(m.active, id)
+		if m.active[id] == active {
+			delete(m.active, id)
+		}
 		m.mu.Unlock()
 	}()
 	select {
 	case m.sem <- struct{}{}:
-	case <-m.ctx.Done():
+	case <-active.ctx.Done():
+		m.finishCanceled(id, active)
 		return
 	}
 	defer func() { <-m.sem }()
 
-	task, err := m.server.db.GetTask(m.ctx, id)
+	task, err := m.server.db.GetTask(active.ctx, id)
 	if err != nil {
+		if active.ctx.Err() != nil {
+			m.finishCanceled(id, active)
+		}
+		return
+	}
+	if task.Status == "paused" || task.Status == "success" {
 		return
 	}
 	if err := m.update(id, func(current *TaskRecord) {
+		if current.Status == "paused" || current.Status == "success" {
+			return
+		}
 		current.Status = "running"
 		if current.Stage == "" || current.Stage == "失败" || current.Stage == "等待重试" {
 			current.Stage = "准备恢复"
 		}
 		current.Error = ""
 	}); err != nil {
+		if active.ctx.Err() != nil {
+			m.finishCanceled(id, active)
+		}
 		return
 	}
 
-	runErr := m.runTask(task)
+	runErr := m.runTask(active.ctx, task)
+	if active.ctx.Err() != nil {
+		m.finishCanceled(id, active)
+		return
+	}
 	if runErr != nil {
 		_ = m.update(id, func(current *TaskRecord) {
+			if current.Status != "running" {
+				return
+			}
 			current.Status = "error"
 			current.Stage = "失败"
 			current.Error = runErr.Error()
@@ -127,6 +262,9 @@ func (m *TaskManager) run(id string) {
 		return
 	}
 	_ = m.update(id, func(current *TaskRecord) {
+		if current.Status != "running" {
+			return
+		}
 		current.Status = "success"
 		current.Stage = "已完成"
 		current.Progress = 100
@@ -134,12 +272,29 @@ func (m *TaskManager) run(id string) {
 	})
 }
 
-func (m *TaskManager) runTask(task TaskRecord) error {
+func (m *TaskManager) finishCanceled(id string, active *activeTask) {
+	switch active.requestedAction() {
+	case taskCancelPause:
+		_ = m.update(id, func(current *TaskRecord) {
+			if current.Status == "success" {
+				return
+			}
+			current.Status = "paused"
+			current.Stage = "已暂停"
+			current.Error = ""
+			current.Progress = minFloat(current.Progress, 99)
+		})
+	case taskCancelDelete:
+		return
+	}
+}
+
+func (m *TaskManager) runTask(ctx context.Context, task TaskRecord) error {
 	switch task.Kind {
 	case "video":
-		return m.server.runVideoTask(m.ctx, task)
+		return m.server.runVideoTask(ctx, task)
 	case "sprite":
-		return m.server.runSpriteTask(m.ctx, task)
+		return m.server.runSpriteTask(ctx, task)
 	default:
 		return fmt.Errorf("unsupported task kind %q", task.Kind)
 	}

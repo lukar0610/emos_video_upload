@@ -126,6 +126,26 @@ export function useTaskQueue() {
     }
   }
 
+  async function pauseTask(task: TaskStatus) {
+    taskError.value = ''
+    try {
+      await api.post(`api/tasks/${task.task_id}/pause`).json<TaskStatus>()
+      await loadTasks()
+    } catch (error) {
+      taskError.value = await errorMessage(error)
+    }
+  }
+
+  async function resumeTask(task: TaskStatus) {
+    taskError.value = ''
+    try {
+      await api.post(`api/tasks/${task.task_id}/resume`).json<TaskStatus>()
+      await loadTasks()
+    } catch (error) {
+      taskError.value = await errorMessage(error)
+    }
+  }
+
   async function deleteTask(task: TaskStatus) {
     deleteCandidate.value = task
   }
@@ -171,6 +191,8 @@ export function useTaskQueue() {
     taskSpeed,
     loadTasks,
     retryTask,
+    pauseTask,
+    resumeTask,
     deleteTask,
     deleteCandidate,
     confirmDeleteTask,

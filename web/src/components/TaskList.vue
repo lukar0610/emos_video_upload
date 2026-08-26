@@ -14,6 +14,8 @@
     taskSpeed,
     loadTasks,
     retryTask,
+    pauseTask,
+    resumeTask,
     deleteTask,
     deleteCandidate,
     confirmDeleteTask,
@@ -27,6 +29,8 @@
         return '排队中'
       case 'running':
         return '进行中'
+      case 'paused':
+        return '已暂停'
       case 'success':
         return '已完成'
       case 'error':
@@ -92,6 +96,7 @@
             <span
               :class="{
                 'bg-warning-soft text-[#8b5d21]': task.status === 'running' || task.status === 'queued',
+                'bg-[#eef2f3] text-[#60717a]': task.status === 'paused',
                 'bg-accent-soft text-[#36715a]': task.status === 'success',
                 'bg-danger-soft text-danger': task.status === 'error',
               }"
@@ -119,8 +124,12 @@
           </div>
         </div>
         <div class="flex justify-end gap-[13px] max-lg:justify-start">
+          <button v-if="task.status === 'running' || task.status === 'queued'" class="bg-transparent p-0 text-[13px] font-bold text-accent transition hover:text-accent-dark" @click="pauseTask(task)">
+            暂停
+          </button>
+          <button v-if="task.status === 'paused'" class="bg-transparent p-0 text-[13px] font-bold text-accent transition hover:text-accent-dark" @click="resumeTask(task)">继续</button>
           <button v-if="task.status === 'error'" class="bg-transparent p-0 text-[13px] font-bold text-accent transition hover:text-accent-dark" @click="retryTask(task)">重试</button>
-          <button v-if="task.status !== 'running'" class="bg-transparent p-0 text-[13px] font-bold text-danger transition hover:text-danger/80" @click="deleteTask(task)">删除</button>
+          <button class="bg-transparent p-0 text-[13px] font-bold text-danger transition hover:text-danger/80" @click="deleteTask(task)">删除</button>
         </div>
         <div v-if="task.error" class="col-span-full border-l-[3px] border-danger bg-danger-soft px-2.5 py-2 text-xs leading-5 text-danger">{{ task.error }}</div>
       </div>
@@ -149,7 +158,10 @@
   <div v-if="deleteCandidate" class="fixed inset-0 z-20 grid place-items-center bg-slate-900/40 p-6" @click.self="cancelDeleteTask">
     <section aria-labelledby="delete-task-title" aria-modal="true" class="w-full max-w-[420px] rounded-lg border border-line bg-white p-6 shadow-[0_18px_48px_rgb(15_23_42/20%)]" role="dialog">
       <h3 id="delete-task-title" class="m-0 mb-2 text-base text-ink">删除上传任务</h3>
-      <p class="m-0 text-[13px] text-muted">确定删除“{{ deleteCandidate.file_name || deleteCandidate.task_id }}”吗？</p>
+      <p class="m-0 text-[13px] text-muted">
+        确定删除“{{ deleteCandidate.file_name || deleteCandidate.task_id }}”吗？
+        <template v-if="deleteCandidate.status === 'running'">正在上传的请求会被停止。</template>
+      </p>
       <div class="mt-6 flex justify-end gap-2.5">
         <button
           class="min-h-10 rounded-md border border-[#c7dce2] bg-[#f4fafb] px-4 text-[13px] font-bold text-[#245d6d] transition hover:border-[#a4c8d1] hover:bg-accent-soft hover:text-accent-dark"

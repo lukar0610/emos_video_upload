@@ -106,7 +106,7 @@ export interface TaskStatus {
   episode_number?: number
   video_title?: string
   storage?: string
-  status: 'queued' | 'running' | 'success' | 'error' | string
+  status: 'queued' | 'running' | 'paused' | 'success' | 'error' | string
   stage: string
   progress: number
   uploaded_bytes: number

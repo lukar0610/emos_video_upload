@@ -13,8 +13,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const databaseSchemaVersion = 2
-
 type Database struct {
 	sql *sql.DB
 }
@@ -58,14 +56,6 @@ func (d *Database) configure(ctx context.Context) error {
 }
 
 func (d *Database) initializeSchema(ctx context.Context) error {
-	var version int
-	if err := d.sql.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("read sqlite schema version: %w", err)
-	}
-	if version == databaseSchemaVersion {
-		return nil
-	}
-
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin sqlite schema setup: %w", err)
@@ -74,13 +64,8 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 		_ = tx.Rollback()
 		return fmt.Errorf("initialize sqlite schema: %w", cause)
 	}
-	for _, table := range []string{"tasks", "upload_tokens", "probe_cache", "directory_metadata"} {
-		if _, err = tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
-			return rollback(err)
-		}
-	}
 	_, err = tx.ExecContext(ctx, `
-		CREATE TABLE tasks (
+		CREATE TABLE IF NOT EXISTS tasks (
 			id TEXT PRIMARY KEY,
 			kind TEXT NOT NULL,
 			path TEXT NOT NULL,
@@ -94,7 +79,7 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 			video_title TEXT NOT NULL DEFAULT '',
 			storage TEXT NOT NULL DEFAULT '',
 			generate_sprites INTEGER NOT NULL DEFAULT 0,
-			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'error')),
+			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'paused', 'success', 'error')),
 			stage TEXT NOT NULL DEFAULT '',
 			progress REAL NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
 			uploaded_bytes INTEGER NOT NULL DEFAULT 0,
@@ -107,15 +92,15 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 			updated_at TEXT NOT NULL
 		);
 
-		CREATE INDEX idx_tasks_created_at ON tasks(created_at DESC);
-		CREATE INDEX idx_tasks_status ON tasks(status);
-		CREATE INDEX idx_tasks_path ON tasks(path);
-		CREATE UNIQUE INDEX idx_tasks_active_identity ON tasks(
+		CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+		CREATE INDEX IF NOT EXISTS idx_tasks_path ON tasks(path);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_identity ON tasks(
 			path, file_size, file_mtime_ns, kind, item_type, item_id,
 			season_number, episode_number, storage
-		) WHERE status IN ('queued', 'running');
+		) WHERE status IN ('queued', 'running', 'paused');
 
-		CREATE TABLE upload_tokens (
+		CREATE TABLE IF NOT EXISTS upload_tokens (
 			cache_key TEXT PRIMARY KEY,
 			path TEXT NOT NULL,
 			file_size INTEGER NOT NULL,
@@ -128,13 +113,14 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 			expires_at TEXT NOT NULL,
 			completed INTEGER NOT NULL DEFAULT 0,
 			presigns_json TEXT NOT NULL DEFAULT '',
+			multipart_parts_json TEXT NOT NULL DEFAULT '',
 			multipart_completed INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
-		CREATE INDEX idx_upload_tokens_expiry ON upload_tokens(expires_at);
+		CREATE INDEX IF NOT EXISTS idx_upload_tokens_expiry ON upload_tokens(expires_at);
 
-		CREATE TABLE probe_cache (
+		CREATE TABLE IF NOT EXISTS probe_cache (
 			path TEXT PRIMARY KEY,
 			file_size INTEGER NOT NULL,
 			file_mtime_ns INTEGER NOT NULL,
@@ -143,13 +129,11 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 			updated_at TEXT NOT NULL
 		);
 
-		CREATE TABLE directory_metadata (
+		CREATE TABLE IF NOT EXISTS directory_metadata (
 			path TEXT PRIMARY KEY,
 			todb_id INTEGER NOT NULL CHECK (todb_id > 0),
 			updated_at TEXT NOT NULL
 		);
-
-		PRAGMA user_version = 2;
 	`)
 	if err != nil {
 		return rollback(err)
@@ -217,7 +201,7 @@ func (d *Database) CreateTask(ctx context.Context, task TaskRecord) (TaskRecord,
 		WHERE path = ? AND file_size = ? AND file_mtime_ns = ?
 			AND kind = ? AND item_type = ? AND item_id = ?
 			AND season_number = ? AND episode_number = ? AND storage = ?
-			AND status IN ('queued', 'running')
+			AND status IN ('queued', 'running', 'paused')
 		ORDER BY created_at DESC LIMIT 1
 	`, task.Path, task.FileSize, task.FileMtimeNS, task.Kind, task.ItemType, task.ItemID,
 		task.SeasonNumber, task.EpisodeNumber, task.Storage))
@@ -296,10 +280,33 @@ func (d *Database) ResetRunningTasks(ctx context.Context) error {
 }
 
 func (d *Database) ResetTaskForRetry(ctx context.Context, id string) error {
+	return d.QueueTask(ctx, id, "等待重试")
+}
+
+func (d *Database) QueueTask(ctx context.Context, id, stage string) error {
 	result, err := d.sql.ExecContext(ctx, `
 		UPDATE tasks
-		SET status = 'queued', stage = '等待重试', error = '', updated_at = ?
+		SET status = 'queued', stage = ?, error = '', updated_at = ?
 		WHERE id = ? AND status <> 'success'
+	`, stage, formatTime(time.Now()), id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (d *Database) PauseTask(ctx context.Context, id string) error {
+	result, err := d.sql.ExecContext(ctx, `
+		UPDATE tasks
+		SET status = 'paused', stage = '已暂停', error = '', updated_at = ?
+		WHERE id = ? AND status IN ('queued', 'running')
 	`, formatTime(time.Now()), id)
 	if err != nil {
 		return err
@@ -355,7 +362,7 @@ func (d *Database) DeleteTask(ctx context.Context, id string) error {
 					AND tasks.file_size = upload_tokens.file_size
 					AND tasks.file_mtime_ns = upload_tokens.file_mtime_ns
 					AND tasks.storage = upload_tokens.storage
-					AND tasks.status IN ('queued', 'running')
+					AND tasks.status IN ('queued', 'running', 'paused')
 			)
 	`); err != nil {
 		_ = tx.Rollback()
@@ -426,6 +433,7 @@ type UploadTokenRecord struct {
 	ExpiresAt          time.Time
 	Completed          bool
 	PresignsJSON       string
+	MultipartPartsJSON string
 	MultipartCompleted bool
 }
 
@@ -433,7 +441,7 @@ func (d *Database) GetUploadToken(ctx context.Context, cacheKey string) (UploadT
 	return scanUploadToken(d.sql.QueryRowContext(ctx, `
 		SELECT cache_key, path, file_size, file_mtime_ns, storage, token_type,
 			file_id, upload_url, raw_json, expires_at, completed,
-			presigns_json, multipart_completed
+			presigns_json, multipart_parts_json, multipart_completed
 		FROM upload_tokens WHERE cache_key = ?
 	`, cacheKey))
 }
@@ -444,8 +452,8 @@ func (d *Database) SaveUploadToken(ctx context.Context, record UploadTokenRecord
 		INSERT INTO upload_tokens (
 			cache_key, path, file_size, file_mtime_ns, storage, token_type, file_id,
 			upload_url, raw_json, expires_at, completed, presigns_json,
-			multipart_completed, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			multipart_parts_json, multipart_completed, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(cache_key) DO UPDATE SET
 			path = excluded.path,
 			file_size = excluded.file_size,
@@ -458,12 +466,13 @@ func (d *Database) SaveUploadToken(ctx context.Context, record UploadTokenRecord
 			expires_at = excluded.expires_at,
 			completed = excluded.completed,
 			presigns_json = excluded.presigns_json,
+			multipart_parts_json = excluded.multipart_parts_json,
 			multipart_completed = excluded.multipart_completed,
 			updated_at = excluded.updated_at
 	`, record.CacheKey, record.Path, record.FileSize, record.FileMtimeNS, record.Storage,
 		record.TokenType, record.FileID, record.UploadURL, record.RawJSON,
 		formatTime(record.ExpiresAt), boolInt(record.Completed), record.PresignsJSON,
-		boolInt(record.MultipartCompleted), now, now)
+		record.MultipartPartsJSON, boolInt(record.MultipartCompleted), now, now)
 	return err
 }
 
@@ -471,6 +480,15 @@ func (d *Database) SaveMultipartPresigns(ctx context.Context, cacheKey, value st
 	_, err := d.sql.ExecContext(ctx, `
 		UPDATE upload_tokens
 		SET presigns_json = ?, updated_at = ?
+		WHERE cache_key = ?
+	`, value, formatTime(time.Now()), cacheKey)
+	return err
+}
+
+func (d *Database) SaveMultipartParts(ctx context.Context, cacheKey, value string) error {
+	_, err := d.sql.ExecContext(ctx, `
+		UPDATE upload_tokens
+		SET multipart_parts_json = ?, updated_at = ?
 		WHERE cache_key = ?
 	`, value, formatTime(time.Now()), cacheKey)
 	return err
@@ -536,7 +554,7 @@ func scanUploadToken(row scanner) (UploadTokenRecord, error) {
 		&record.CacheKey, &record.Path, &record.FileSize, &record.FileMtimeNS,
 		&record.Storage, &record.TokenType, &record.FileID, &record.UploadURL,
 		&record.RawJSON, &expiresAt, &completed, &record.PresignsJSON,
-		&multipartCompleted,
+		&record.MultipartPartsJSON, &multipartCompleted,
 	); err != nil {
 		return UploadTokenRecord{}, err
 	}

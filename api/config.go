@@ -18,6 +18,7 @@ const (
 	defaultServerPort        = 8004
 	defaultFFprobePath       = "/usr/bin/ffprobe"
 	defaultHTTPTimeout       = 30 * time.Second
+	defaultR2UploadTimeout   = 10 * time.Minute
 	defaultChunkSize         = 100 << 20
 	defaultUploadConcurrency = 3
 	defaultUploadRetryMax    = 3
@@ -44,6 +45,7 @@ type Config struct {
 	FFprobePath string
 
 	HTTPTimeout          time.Duration
+	R2UploadTimeout      time.Duration
 	UploadChunkSizeBytes int64
 	UploadConcurrency    int
 	UploadRetryMax       int
@@ -98,6 +100,10 @@ func LoadConfig(envFile string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	r2UploadTimeout, err := parseDurationValue(values, "R2_UPLOAD_TIMEOUT", defaultR2UploadTimeout)
+	if err != nil {
+		return Config{}, err
+	}
 
 	videoRoot := strings.TrimSpace(values["VIDEO_ROOT"])
 	if videoRoot != "" {
@@ -109,7 +115,7 @@ func LoadConfig(envFile string) (Config, error) {
 
 	cfg := Config{
 		WorkingDir:           workingDir,
-		DBPath:               filepath.Join(workingDir, "dbdata", "emos_video_upload.db"),
+		DBPath:               filepath.Join(workingDir, "dbdata", "260826.db"),
 		Username:             strings.TrimSpace(values["USERNAME"]),
 		Password:             values["PASSWORD"],
 		EMOSURL:              strings.TrimRight(strings.TrimSpace(values["EMOS_URL"]), "/"),
@@ -121,6 +127,7 @@ func LoadConfig(envFile string) (Config, error) {
 		ServerPort:           serverPort,
 		FFprobePath:          firstNonEmpty(values["FFPROBE_PATH"], defaultFFprobePath),
 		HTTPTimeout:          httpTimeout,
+		R2UploadTimeout:      r2UploadTimeout,
 		UploadChunkSizeBytes: uploadChunkSize,
 		UploadConcurrency:    uploadConcurrency,
 		UploadRetryMax:       uploadRetryMax,
@@ -138,6 +145,9 @@ func (c Config) validateValues() error {
 	}
 	if c.HTTPTimeout <= 0 {
 		return errors.New("HTTP_TIMEOUT must be positive")
+	}
+	if c.R2UploadTimeout <= 0 {
+		return errors.New("R2_UPLOAD_TIMEOUT must be positive")
 	}
 	if c.UploadChunkSizeBytes < minUploadChunkSize {
 		return fmt.Errorf("UPLOAD_CHUNK_SIZE_BYTES must be at least %d", minUploadChunkSize)
