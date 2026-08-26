@@ -9,8 +9,7 @@
     'select-directory': [directory: DirectorySelection | null]
   }>()
 
-  const { currentPath, rootPath, directories, files, selectedFile, directoryLoading, folderTodbId, canGoUp, error, initialize, openDirectory, goUp, scanCurrentDirectory, selectFile } =
-    useSourceBrowser()
+  const { currentPath, rootPath, directories, files, selectedFile, directoryLoading, folderTodbId, canGoUp, error, initialize, openDirectory, goUp, selectFile } = useSourceBrowser()
 
   const searchQuery = ref('')
   const normalizedSearchQuery = computed(() => searchQuery.value.trim().toLocaleLowerCase())

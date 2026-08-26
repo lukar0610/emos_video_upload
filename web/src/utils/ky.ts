@@ -22,7 +22,7 @@ const instance = ky.create({
 export async function errorMessage(error: unknown) {
   if (error instanceof HTTPError) {
     try {
-      const body = await error.response.clone().json<{ error?: string }>()
+      const body = (await error.response.clone().json()) as { error?: string }
       if (body.error) {
         return body.error
       }

@@ -72,7 +72,7 @@
         <button
           :disabled="tasksLoading"
           class="min-h-[34px] rounded-md border border-line bg-[#f7f9fa] px-[11px] text-xs font-bold text-[#536975] transition hover:border-[#a7cbd3] hover:bg-accent-soft hover:text-accent-dark"
-          @click="loadTasks">
+          @click="loadTasks()">
           刷新
         </button>
       </div>

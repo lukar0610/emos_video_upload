@@ -1,11 +1,10 @@
 import { computed, ref } from 'vue'
+import { useLocalStorage } from '@vueuse/core'
 import { defineStore } from 'pinia'
 
-const storage = typeof window === 'undefined' ? null : window.sessionStorage
-
 export const useSignStore = defineStore('sign', () => {
-  const username = ref(storage?.getItem('emos_username') ?? '')
-  const authorizationHeader = ref(storage?.getItem('emos_authorization') ?? '')
+  const username = useLocalStorage<string | null>('emos_username', null)
+  const authorizationHeader = useLocalStorage<string | null>('emos_authorization', null)
   const authEnabled = ref(true)
   const authenticated = ref(false)
   const fileStorages = ref<string[]>([])
@@ -15,8 +14,6 @@ export const useSignStore = defineStore('sign', () => {
   function setSession(nextUsername: string, authorization: string) {
     username.value = nextUsername.trim()
     authorizationHeader.value = authorization
-    storage?.setItem('emos_username', username.value)
-    storage?.setItem('emos_authorization', authorizationHeader.value)
   }
 
   function setAuthState(enabled: boolean, isAuthenticated: boolean) {
@@ -29,15 +26,13 @@ export const useSignStore = defineStore('sign', () => {
   }
 
   function signOut() {
-    username.value = ''
-    authorizationHeader.value = ''
+    username.value = null
+    authorizationHeader.value = null
     authenticated.value = false
-    storage?.removeItem('emos_username')
-    storage?.removeItem('emos_authorization')
   }
 
   function authorization() {
-    return authorizationHeader.value
+    return authorizationHeader.value ?? ''
   }
 
   return {

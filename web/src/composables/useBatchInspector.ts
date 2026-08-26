@@ -147,6 +147,7 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
       matchedAssignments.value.every(
         (assignment) =>
           assignment.probe?.valid &&
+          Boolean(assignment.storageType) &&
           !assignment.probeLoading &&
           !assignment.baseLoading &&
           (assignment.target?.has_media !== true ||
@@ -165,9 +166,14 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
     if (unprobedAssignments.value.length > 0) return `${unprobedAssignments.value.length} 个文件尚未完成校验`
     if (missingBaseInfoAssignments.value.length > 0) return `${missingBaseInfoAssignments.value.length} 个文件的目标信息读取失败`
     if (duplicateAssignments.value.length > 0) return `请确认 ${duplicateAssignments.value.length} 个重复资源是否仍要上传`
+    if (matchedAssignments.value.some((assignment) => !assignment.storageType)) return '请选择储存位置'
     if (matchedAssignments.value.some((assignment) => assignment.baseLoading)) return '正在读取目标信息'
     return ''
   })
+
+  function defaultStorageType() {
+    return sign.fileStorages.includes(bulkStorageType.value) ? bulkStorageType.value : (sign.fileStorages[0] ?? '')
+  }
 
   function clearSelection(resetAssignments = true) {
     selectedMovie.value = null
@@ -177,14 +183,6 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
     }
     searchResults.value = []
     notice.value = ''
-  }
-
-  function inferredTitle(nextFiles: SourceFile[]) {
-    const directoryTitle = stripVideoNameTags(basename(directory.value?.path ?? ''))
-    if (directoryTitle && directoryTitle.toLowerCase() !== 'video') {
-      return directoryTitle
-    }
-    return stripVideoNameTags(nextFiles[0]?.name ?? '')
   }
 
   function findEpisode(seasonNumber: number | null, episodeNumber: number | null) {
@@ -220,7 +218,7 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
               episode_number: option.episodeNumber,
             }
           : null,
-      storageType: sign.fileStorages[0] ?? '',
+      storageType: defaultStorageType(),
       probe: null,
       probeLoading: false,
       baseInfo: null,
@@ -245,7 +243,7 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
     selectedMovie.value = item
     selectedSeries.value = null
     assignments.value = files.value
-      .map((file) => ({
+      .map<BatchAssignment>((file) => ({
         file,
         enabled: previousAssignments.get(file.id)?.enabled ?? true,
         seasonNumber: null,
@@ -259,7 +257,8 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
           video_title: item.title,
           has_media: item.has_media,
         },
-        storageType: sign.fileStorages[0] ?? '',
+        storageType: defaultStorageType(),
+        probe: null,
         probeLoading: false,
         baseInfo: null,
         baseLoading: false,
@@ -475,6 +474,12 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
       return
     }
     bulkStorageType.value = storage
+  }
+
+  function syncStorageToAssignments(storage: string) {
+    if (!sign.fileStorages.includes(storage)) {
+      return
+    }
     assignments.value.forEach((assignment) => {
       assignment.storageType = storage
     })
@@ -572,6 +577,9 @@ export function useBatchInspector(directory: Ref<DirectorySelection | null>) {
     },
     { immediate: true },
   )
+  watch(bulkStorageType, (storage) => {
+    syncStorageToAssignments(storage)
+  })
 
   return {
     files,
