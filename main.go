@@ -38,6 +38,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	cfg.Version = version
 	staticFS, err := fs.Sub(frontend, "web/dist")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

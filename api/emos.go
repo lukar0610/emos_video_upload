@@ -14,9 +14,10 @@ import (
 )
 
 type EMOSClient struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	baseURL   string
+	token     string
+	userAgent string
+	client    *http.Client
 }
 
 func NewEMOSClient(cfg Config) (*EMOSClient, error) {
@@ -24,10 +25,19 @@ func NewEMOSClient(cfg Config) (*EMOSClient, error) {
 		return nil, errors.New("EMOS_URL and EMOS_TOKEN are required")
 	}
 	return &EMOSClient{
-		baseURL: strings.TrimRight(cfg.EMOSURL, "/"),
-		token:   cfg.EMOSToken,
-		client:  &http.Client{Timeout: cfg.HTTPTimeout},
+		baseURL:   strings.TrimRight(cfg.EMOSURL, "/"),
+		token:     cfg.EMOSToken,
+		userAgent: emosUserAgent(cfg.Version),
+		client:    &http.Client{Timeout: cfg.HTTPTimeout},
 	}, nil
+}
+
+func emosUserAgent(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = "dev"
+	}
+	return "emos_video_upload/" + version
 }
 
 func (c *EMOSClient) GetVideoTree(ctx context.Context, videoType, title, todbID string) ([]VideoTreeItem, error) {
@@ -121,6 +131,7 @@ func (c *EMOSClient) doJSON(ctx context.Context, method, path string, payload an
 		return err
 	}
 	request.Header.Set("Authorization", "Bearer "+c.token)
+	request.Header.Set("User-Agent", c.userAgent)
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

@@ -28,6 +28,7 @@ const (
 type Config struct {
 	WorkingDir string
 	DBPath     string
+	Version    string
 
 	Username string
 	Password string
